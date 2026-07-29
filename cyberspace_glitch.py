@@ -20,7 +20,7 @@ from rembg import remove, new_session
 from PIL import Image
 
 # ── 常量 ───────────────────────────────────────────────────────
-TARGET_WIDTH = 1280           # 720p 宽度
+TARGET_WIDTH = 1920           # 1080p 宽度（提高分辨率，让点阵颗粒更清晰）
 NUM_POINTS = 8000             # 点云点数
 Z_LAYERS = 3                  # 深度层数（3层）
 PIXEL_SORT_STRIPS = 15        # 像素排序竖条数
@@ -104,69 +104,51 @@ def get_dot_mask(h, w, pitch_x=10, pitch_y=3, radius=1):
     return big
 
 
-def generate_digital_wall(w, h, layers=3, seed=42):
+def generate_digital_wall(w, h, layers=2, seed=42):
     """
-    生成与原始视频内容无关的竖直"点阵面板墙"结构：
-    每层由若干个有宽度的矩形面板组成，面板高度/亮度都是固定值（不随帧数变化），
-    近层面板更宽、间距更大，远层更窄更密，制造纵深。
+    生成背景点阵的深度层参数：每层一个整体亮度系数 + 轻微的水平采样偏移，
+    用于在"内容采样"的基础上叠加一点层次感（近层更亮、偏移更大，制造纵深）。
+    结构本身（点的位置）由 get_dot_mask 决定，这里只负责"深度感"的调制参数。
     """
     rng = np.random.default_rng(seed)
     layers_data = []
     for layer in range(layers):
-        depth = (layer + 1) / layers          # 0.33 / 0.67 / 1.0，越大代表越"近"
-        panel_w = int(16 + layer * 12)
-        gap = int(10 + layer * 6)
-        step = panel_w + gap
-        n_panels = w // step + 3
-        offset = int(rng.integers(0, step))
-        xs = np.arange(-step, n_panels * step, step) + offset
-        heights = rng.integers(int(h * 0.25), h, size=len(xs))
-        # 每根面板固定的亮度差异（不随时间变化，只是"这根面板比那根亮一点"）
-        brightness_jitter = rng.uniform(0.75, 1.0, size=len(xs))
-        widths = np.clip(panel_w + rng.integers(-4, 5, size=len(xs)), 6, None)
-        layers_data.append({"xs": xs, "heights": heights, "brightness_jitter": brightness_jitter,
-                            "widths": widths, "depth": depth})
+        depth = (layer + 1) / layers          # 0.5 / 1.0，越大代表越"近"、越亮
+        x_shift = int(rng.integers(-6, 7) * (layer + 1))
+        layers_data.append({"depth": depth, "x_shift": x_shift})
     return layers_data
 
 
-def draw_digital_wall(canvas, layers_data, lut,
-                      dot_pitch_x=10, dot_pitch_y=3, dot_radius=1,
-                      brightness_floor=175, brightness_ceil=255):
+def draw_digital_wall(canvas, frame, layers_data, lut,
+                      dot_pitch_x=20, dot_pitch_y=4, dot_radius=1,
+                      brightness_floor=35, brightness_ceil=255):
     """
-    绘制静态点阵面板墙：高度、亮度完全固定，逐帧渲染结果一致，
-    不会有任何"生长/流动"动画——只呈现网格点结构本身。
-    亮度大段维持在 [brightness_floor, brightness_ceil] 饱和区间，
-    保证面板本身"鲜亮"，只有面板之间的空隙才是纯黑。
+    根据原始帧内容采样绘制点阵背景：每个点的颜色由该位置在原始视频上的亮度决定
+    （而不是纯程序化生成），经过 brightness_floor 兜底后映射到 BG_LUT，
+    保证暗区也不会因为亮度过低而"隐形"（这是最早版本背景呈圆形的根因，这里明确规避）。
+
+    点阵位置固定为网格（竖密横疏），pitch 与 dot_radius 的比例经过校正，
+    保证相邻点之间有真实的黑色间隙、不会因为半径大于间距而糊成连续线条。
     """
     h, w = canvas.shape[:2]
+    gray = cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY).astype(np.float32)
     dot_mask_full = get_dot_mask(h, w, dot_pitch_x, dot_pitch_y, dot_radius)
-    canvas_f = canvas.astype(np.float32)
+    canvas_f = np.zeros((h, w, 3), dtype=np.float32)
+    span = brightness_ceil - brightness_floor
 
     for layer in layers_data:
         depth = layer["depth"]
-        for x0, panel_h, bj, pw in zip(layer["xs"], layer["heights"],
-                                        layer["brightness_jitter"], layer["widths"]):
-            x0 = int(x0)
-            x1 = int(min(w, x0 + pw))
-            x0c = max(0, x0)
-            if x0c >= x1:
-                continue
-            vis_h = int(min(h, panel_h))
-            if vis_h <= 0:
-                continue
-            span = brightness_ceil - brightness_floor
-            brightness = int(np.clip(brightness_floor + span * depth * bj, brightness_floor * 0.85, 255))
-            color = lut[brightness].astype(np.float32)
-
-            panel_dots = dot_mask_full[0:vis_h, x0c:x1]
-            if panel_dots.size == 0:
-                continue
-            panel_rgb = panel_dots[:, :, None] * color[None, None, :]
-            region = canvas_f[0:vis_h, x0c:x1]
-            canvas_f[0:vis_h, x0c:x1] = np.maximum(region, panel_rgb)
+        x_shift = layer["x_shift"]
+        # 用小幅水平位移采样，制造多层视差叠加的纵深感（同一份内容，略微错位）
+        sampled = np.roll(gray, x_shift, axis=1)
+        brightness = np.clip(brightness_floor + span * (sampled / 255.0) * (0.5 + 0.5 * depth), 0, 255)
+        color = map_luminance_to_color(brightness, lut).astype(np.float32)  # (h, w, 3)
+        layer_rgb = dot_mask_full[:, :, None] * color
+        canvas_f = np.maximum(canvas_f, layer_rgb)
 
     canvas[:] = np.clip(canvas_f, 0, 255).astype(np.uint8)
     return canvas
+
 
 
 def generate_test_video(output_path: str, num_frames: int = 500,
@@ -580,10 +562,8 @@ def main():
     # ── 残影历史 ──
     ghost_frames = deque(maxlen=GHOST_MAX_FRAMES)
 
-    # ── 初始化程序化数据墙背景（不依赖视频内容，且现在是静态网格，只需算一次） ──
+    # ── 背景数据墙的深度层参数（只需生成一次，颜色本身逐帧根据当前帧采样） ──
     layers_data = generate_digital_wall(TARGET_WIDTH, target_h)
-    static_bg_canvas = np.zeros((target_h, TARGET_WIDTH, 3), dtype=np.uint8)
-    draw_digital_wall(static_bg_canvas, layers_data, BG_LUT)
     start_time = time.time()
     frame_idx = 0
 
@@ -595,7 +575,7 @@ def main():
         frame_idx += 1
         frame_start = time.time()
 
-        # ── 缩放到 720p ──
+        # ── 缩放到 1080p ──
         frame = cv2.resize(raw_frame, (TARGET_WIDTH, target_h))
         cv2.cvtColor(frame, cv2.COLOR_BGR2GRAY)
 
@@ -622,9 +602,10 @@ def main():
             print(f"[WARN] rembg error on frame {frame_idx}: {e}, using full mask")
             mask = np.full((target_h, TARGET_WIDTH), 255, dtype=np.uint8)
 
-        # ── 背景：静态数据墙（循环外已算好），但要挖掉人物轮廓区域，
-        #     避免人物点阵间隙里透出背景的蓝色点，把红色弄脏 ──
-        bg_canvas = static_bg_canvas.copy()
+        # ── 背景：逐帧根据当前帧内容采样绘制（颜色跟随视频背景变化），
+        #     再挖掉人物轮廓区域，避免人物点阵间隙里透出背景的蓝色点，把红色弄脏 ──
+        bg_canvas = np.zeros((target_h, TARGET_WIDTH, 3), dtype=np.uint8)
+        draw_digital_wall(bg_canvas, frame, layers_data, BG_LUT)
         bg_canvas[mask > 128] = 0
 
         # ── 渲染人物点云 ──
