@@ -20,7 +20,11 @@ The result is a CPU-only renderer that combines:
 
 No GPU is required.
 
-![Demo](assets/output.gif)
+<p align="center">
+  <picture>
+    <img src="assets/output.gif" alt="Demo" width="900">
+  </picture>
+</p>
 
 ### Features
 
