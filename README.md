@@ -20,7 +20,7 @@ The result is a CPU-only renderer that combines:
 
 No GPU is required.
 
-[example.gif](https://github.com/erashaperavm/mp4-cyberspace/static/output.gif)
+[example.gif](https://github.com/erashaperavm/mp4-cyberspace/blob/main/static/output.gif)
 
 ### Features
 
